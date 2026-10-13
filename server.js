@@ -1,4 +1,6 @@
+import './src/env.js'; // MUST stay first: loads .env before any other module reads process.env
 import express from 'express';
+import authRoutes from './routes/auth.js';
 import userRoutes from './routes/user.js';
 import adminRoutes from './routes/admin.js';
 import purchaseRoutes from './routes/purchase.js';
@@ -11,6 +13,7 @@ import { asyncHandler } from './src/asyncHandler.js';
 import { policyCache } from './src/sharedCaches.js';
 import { startBootstrap } from './src/bootstrap.js';
 import { STORE_NAME } from './src/store.js';
+import { turnstileConfigured } from './src/turnstile.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -119,6 +122,7 @@ app.get('/api/policy', userCors, asyncHandler(async (req, res) => {
   res.json({ success: true, ...(await policyCache.get()) });
 }));
 
+app.use('/api/auth', authRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/employee', employeeRoutes);
@@ -139,4 +143,5 @@ app.listen(PORT, () => {
   // Creates the few documents the app reads before anyone has written them
   // (config/policy, config/store). Everything else is created on first use.
   startBootstrap();
+  if (!turnstileConfigured()) console.warn('[turnstile] TURNSTILE_SECRET_KEY is not set — the login page cannot verify visitors until you add it.');
 });
