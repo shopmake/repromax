@@ -12,6 +12,29 @@ services:
     name: store-backend
     env: node
     buildCommand: npm install
+# Render Blueprint — creates the service; you only paste the secret values in the dashboard.
+services:
+  - type: web
+    name: store-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: STORE_NAME
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+      - key: TURNSTILE_SECRET_KEY
+        sync: false
+      - key: RESELLER_API_KEY
+        sync: false
+      - key: RESELLER_MASTER_KEY
+        sync: false
+      - key: RESELLER_ENDPOINT
+        value: https://repromax5.onrender.com/api/reseller/v1
     startCommand: npm start
     healthCheckPath: /health
     envVars:
