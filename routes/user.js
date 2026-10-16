@@ -14,7 +14,7 @@ import {
 } from '../src/profileRules.js';
 import { getUserDoc, invalidateUserDoc } from '../src/userCache.js';
 import { rateLimit } from '../src/security.js';
-import { roleOf, resellerProgress } from '../src/roles.js';
+import { roleOf, resellerProgress, roleChangeUpdate } from '../src/roles.js';
 import { QR_MIN_AMOUNT, QR_MAX_AMOUNT, QR_MAX_PENDING, QR_PENDING_WINDOW_MS, QR_METHODS, newReqId, sendRequestToBot } from '../src/topupQr.js';
 
 const router = express.Router();
@@ -314,6 +314,30 @@ router.post('/topup-qr', rateLimit({ windowMs: 10 * 60_000, max: 8, name: 'topup
   } catch (e) { console.warn('[topup-qr] announce failed:', e?.name || 'error'); }
 
   res.json({ success: true, reqId, status: 'PENDING' });
+}));
+
+// POST /api/user/upgrade-reseller — user -> reseller, only when the requirement is met
+// (8 keys bought + NRP 1500 deposited). Checked inside a transaction on the server.
+router.post('/upgrade-reseller', rateLimit({ windowMs: 10 * 60_000, max: 10, name: 'upgrade-reseller' }), asyncHandler(async (req, res) => {
+  const userRef = db().collection('users').doc(req.uid);
+  try {
+    const out = await db().runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) throw new Error('Account not found');
+      const d = snap.data();
+      if (roleOf(d) === 'reseller') throw new Error('You are already a reseller');
+      const rp = resellerProgress(d);
+      if (!rp.eligible) throw new Error(`Not yet: you need ${rp.requiredKeys} keys bought (${rp.keys} now) and NRP ${rp.requiredDeposit} deposited (NRP ${rp.deposited} now).`);
+      const upd = roleChangeUpdate(d, 'reseller', 'self-upgrade');
+      tx.set(userRef, { ...upd.fields, adminLog: [...(d.adminLog || []), ...upd.log] }, { merge: true });
+      return rp;
+    });
+    invalidateUserDoc(req.uid);
+    telegramNotify(`🛒 <b>New RESELLER</b> (self-upgrade)\nUID: <code>${esc(req.uid)}</code>\n${esc(req.email)}`);
+    res.json({ success: true, role: 'reseller', resellerProgress: out });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
 }));
 
 // GET /api/user/topup-history — the user's own top-up requests, newest first (safe display fields only).
