@@ -41,20 +41,26 @@ export async function revenueWindows() {
 export async function backfillRevenue() {
   const snap = await db().collection('orders').where('status', '==', 'completed').get();
   const days = new Map();
+  let skipped = 0;
   snap.forEach((d) => {
-    const o = d.data();
-    const t = Number(o.finishedAt || o.createdAt || 0);
-    if (!t) return;
-    const k = dayKey(t);
-    const cur = days.get(k) || { amount: 0, keys: 0 };
-    cur.amount += Number(o.price || 0); cur.keys += 1;
-    days.set(k, cur);
+    try {
+      const o = d.data();
+      const raw = o.finishedAt ?? o.createdAt;
+      const t = typeof raw === 'number' ? raw : (raw && typeof raw.toMillis === 'function' ? raw.toMillis() : Date.parse(raw));
+      if (!Number.isFinite(t) || t <= 0) { skipped++; return; }
+      const k = dayKey(t);
+      const cur = days.get(k) || { amount: 0, keys: 0 };
+      cur.amount += Number(o.price || 0); cur.keys += 1;
+      days.set(k, cur);
+    } catch (_) { skipped++; }
   });
-  let batch = db().batch(), n = 0;
-  for (const [k, v] of days) {
-    batch.set(db().collection('revenueDaily').doc(k), v);
-    if (++n % 400 === 0) { await batch.commit(); batch = db().batch(); }
+  if (days.size) {                       // an empty batch must never be committed
+    let batch = db().batch(), n = 0;
+    for (const [k, v] of days) {
+      batch.set(db().collection('revenueDaily').doc(k), v);
+      if (++n % 400 === 0) { await batch.commit(); batch = db().batch(); }
+    }
+    if (n % 400 !== 0) await batch.commit();
   }
-  await batch.commit();
-  return { orders: snap.size, days: days.size };
+  return { orders: snap.size, days: days.size, skipped };
 }
