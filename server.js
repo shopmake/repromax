@@ -6,6 +6,8 @@ import adminRoutes from './routes/admin.js';
 import purchaseRoutes from './routes/purchase.js';
 import employeeRoutes from './routes/employee.js';
 import gloryRoutes from './routes/glory.js';
+import telegramTopupRoutes from './routes/telegram-topup.js';
+import { registerTopupWebhook } from './src/topupQr.js';
 import { getLiveCatalog } from './src/catalog.js';
 import { userCors } from './src/firebase.js';
 import { telegramNotify } from './src/telegram.js';
@@ -129,6 +131,8 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/employee', employeeRoutes);
 app.use('/api/purchase', purchaseRoutes);
 app.use('/api/glory', gloryRoutes);
+// Telegram bot: Load ✅ / Cancel ❌ for Khalti & eSewa top-ups + /loadbalance /getinfo /mode /creategiftcards.
+app.use('/api/telegram', telegramTopupRoutes);
 
 // Last-resort error handler — same job as firebase.php's shutdown
 // handler: never let a raw stack trace leak to the client, always
@@ -145,5 +149,6 @@ app.listen(PORT, () => {
   // Creates the few documents the app reads before anyone has written them
   // (config/policy, config/store). Everything else is created on first use.
   startBootstrap();
+  registerTopupWebhook().catch(() => {});
   if (!turnstileConfigured()) console.warn('[turnstile] TURNSTILE_SECRET_KEY is not set — the login page cannot verify visitors until you add it.');
 });
