@@ -58,10 +58,23 @@ export async function requireFirebaseUid(req, res, next) {
     const decoded = await admin.auth().verifyIdToken(match[1]);
     req.uid = decoded.uid;
     req.email = decoded.email || '';
-    next();
   } catch (e) {
     return res.status(401).json({ success: false, error: 'Invalid or expired login. Please refresh and try again.' });
   }
+
+  // Banned accounts (fake-payment strikes / admin ban) are refused on every user route.
+  // If the lookup fails we let the request through rather than lock everyone out.
+  try {
+    const [{ getUserDoc }, { activeBan, banBody }] = await Promise.all([import('./userCache.js'), import('./ban.js')]);
+    const u = await getUserDoc(req.uid);
+    const ban = u && u.exists ? activeBan(u.data) : null;
+    if (ban) {
+      return res.status(403).json(banBody(ban, { name: u.data.profileName || '', uid: req.uid, email: u.data.email || req.email }));
+    }
+  } catch (e) {
+    console.error('[ban] check failed, allowing request', e && e.message);
+  }
+  next();
 }
 
 /**

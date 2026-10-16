@@ -1,4 +1,4 @@
-// src/catalog.js — the product catalog. ONE price list for everyone (no roles).
+// src/catalog.js — the product catalog. Two price lists: user (price) and reseller (priceReseller, falls back to price).
 //
 // Products live in Firestore (`products/{sku}`), added from the admin panel,
 // so adding or editing a product never needs a code deploy. The `products`
@@ -10,6 +10,7 @@
 
 import { db } from './firebase.js';
 import { cachedLoader, TTL } from './cache.js';
+import { tierPrice } from './roles.js';
 
 // ---------------------------------------------------------------
 // Maintenance / out-of-stock flags (admin-controlled)
@@ -50,10 +51,11 @@ const products = cachedLoader(async () => {
 export function invalidateProductCache() { products.invalidate(); }
 
 /** Fresh read of one product — used at checkout so the price and pid are never stale. */
-export async function findProductFresh(sku) {
+export async function findProductFresh(sku, role = 'user') {
   if (!sku) return null; // a Firestore .doc() path can't be empty
   const snap = await db().collection('products').doc(sku).get();
-  return snap.exists ? { sku, ...snap.data() } : null;
+  // `price` in the returned object is what THIS role pays (checkout debits it).
+  return snap.exists ? { sku, ...snap.data(), price: tierPrice(snap.data(), role) } : null;
 }
 
 export async function getProductRaw(sku) {
@@ -93,11 +95,11 @@ export async function deleteWhatsappProduct(id) {
  * maintenance / out-of-stock flags merged on top.
  * Fails OPEN on the flags: if that lookup breaks, products still show.
  */
-export async function getLiveCatalog() {
+export async function getLiveCatalog(role = 'user') {
   const base = {};
 
   try {
-    for (const [sku, p] of Object.entries(await products.get())) base[sku] = { ...p };
+    for (const [sku, p] of Object.entries(await products.get())) base[sku] = { ...p, price: tierPrice(p, role) };
   } catch (e) {
     console.error('[catalog] products unavailable:', e?.message || e);
   }
