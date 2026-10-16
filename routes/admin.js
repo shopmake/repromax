@@ -655,7 +655,12 @@ router.get('/stats', asyncHandler(async (req, res) => {
 
 // POST /api/admin/backfill-revenue — one-time rebuild of the 7/30-day numbers from past completed orders.
 router.post('/backfill-revenue', asyncHandler(async (req, res) => {
-  res.json({ success: true, ...(await backfillRevenue()) });
+  try {
+    res.json({ success: true, ...(await backfillRevenue()) });
+  } catch (e) {
+    console.error('[backfill-revenue] failed:', e);
+    res.status(500).json({ success: false, error: `Rebuild failed: ${String(e?.message || e).slice(0, 200)}` });
+  }
 }));
 
 // GET /api/admin/rankings — top users by spend
