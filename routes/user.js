@@ -13,6 +13,9 @@ import {
   normalizeTikTokUser, normalizeTikTokName,
 } from '../src/profileRules.js';
 import { getUserDoc, invalidateUserDoc } from '../src/userCache.js';
+import { rateLimit } from '../src/security.js';
+import { roleOf, resellerProgress } from '../src/roles.js';
+import { QR_MIN_AMOUNT, QR_MAX_AMOUNT, QR_MAX_PENDING, QR_PENDING_WINDOW_MS, QR_METHODS, newReqId, sendRequestToBot } from '../src/topupQr.js';
 
 const router = express.Router();
 router.use(userCors);
@@ -127,13 +130,21 @@ router.get('/balance', asyncHandler(async (req, res) => {
     // dashboard modal.
     avatarUrl: data.avatarUrl || '',
     policyAcknowledged: !!data.policyAcknowledged,
+    // Mode ('user' | 'reseller') + progress toward the reseller requirement (8 keys + NRP 1500 deposited).
+    role: roleOf(data),
+    resellerProgress: resellerProgress(data),
+    // Fake-payment strikes from cancelled Khalti/eSewa top-ups (null = clean account).
+    fakePayment: data.fakePayment && data.fakePayment.count
+      ? { count: Number(data.fakePayment.count), max: 3, text: data.fakePayment.text || '', lastTx: data.fakePayment.lastTx || '', lastAt: data.fakePayment.lastAt || '' }
+      : null,
   });
 }));
 
-// GET /api/user/catalog — the one catalog every account sees (single price
-// list, no roles). Prices are re-read server-side at checkout regardless.
+// GET /api/user/catalog — the catalog priced for THIS account's mode (user / reseller).
+// Prices are re-read server-side at checkout regardless.
 router.get('/catalog', asyncHandler(async (req, res) => {
-  res.json({ success: true, catalog: await getLiveCatalog() });
+  const snap = await getUserDoc(req.uid);
+  res.json({ success: true, role: roleOf(snap.exists ? snap.data : {}), catalog: await getLiveCatalog(roleOf(snap.exists ? snap.data : {})) });
 }));
 
 // POST /api/user/profile
@@ -245,6 +256,75 @@ router.post('/topup', asyncHandler(async (req,res)=>{
     await telegramNotify(notifyText,'balance');
     return res.json({success:true,request:entry});
   } catch(e) { res.status(409).json({success:false,error:e.message}); }
+}));
+
+// POST /api/user/topup-qr { amount, txCode, method: 'khalti' | 'esewa' }
+// User paid the Khalti or eSewa QR and now sends the transaction ID. We store a PENDING
+// request, then post it to the owner's Telegram bot with [Load ✅] [Cancel ❌].
+// Load credits the balance; Cancel counts as a fake-payment strike (see src/topupQr.js).
+router.post('/topup-qr', rateLimit({ windowMs: 10 * 60_000, max: 8, name: 'topup-qr' }), asyncHandler(async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const txCode = String(req.body?.txCode || '').trim().toUpperCase();
+  const method = String(req.body?.method || '').trim().toLowerCase();
+  const methodLabel = QR_METHODS[method];
+  if (!methodLabel) return res.status(400).json({ success: false, error: 'Choose Khalti or eSewa' });
+  if (!Number.isInteger(amount) || amount < QR_MIN_AMOUNT) return res.status(400).json({ success: false, error: `Minimum top-up is Rs ${QR_MIN_AMOUNT}` });
+  if (amount > QR_MAX_AMOUNT) return res.status(400).json({ success: false, error: 'Amount is too large' });
+  if (!/^[A-Z0-9_-]{6,40}$/.test(txCode)) return res.status(400).json({ success: false, error: 'Enter a valid transaction ID (6-40 letters/numbers)' });
+
+  const reqId = newReqId();
+  const userRef = db().collection('users').doc(req.uid);
+  const txRef = db().collection('topupTx').doc(txCode);      // one transaction ID can only ever be used once, across ALL accounts
+  const idxRef = db().collection('topupQr').doc(reqId);
+  const date = new Date().toISOString();
+  const ip = req.ip || '';
+
+  let profile;
+  try {
+    profile = await db().runTransaction(async (tx) => {
+      const [u, used] = await Promise.all([tx.get(userRef), tx.get(txRef)]);
+      if (used.exists) throw new Error('This transaction ID was already submitted');
+      const d = u.exists ? u.data() : {};
+      const list = Array.isArray(d.topupRequests) ? d.topupRequests : [];
+      const recentCut = Date.now() - QR_PENDING_WINDOW_MS;
+      const recentPending = list.filter((t) => t.status === 'PENDING' && QR_METHODS[String(t.method || '').toLowerCase()] && new Date(t.date).getTime() > recentCut);
+      if (recentPending.length >= QR_MAX_PENDING) {
+        const oldest = Math.min(...recentPending.map((t) => new Date(t.date).getTime()));
+        const mins = Math.max(1, Math.ceil((oldest + QR_PENDING_WINDOW_MS - Date.now()) / 60000));
+        throw new Error(`You already have ${recentPending.length} top-ups waiting to be checked. You can send a new one in about ${mins} min.`);
+      }
+      const entry = { date, amount, paymentAccount: `${methodLabel} QR (${STORE_NAME})`, method: methodLabel, txCode, status: 'PENDING', uid: req.uid, email: req.email, reqId, ip };
+      tx.set(userRef, { topupRequests: [...list, entry] }, { merge: true });
+      tx.set(txRef, { uid: req.uid, reqId, at: date });
+      tx.set(idxRef, { uid: req.uid, txCode, amount, method: methodLabel, status: 'PENDING', createdAt: date, messages: [] });
+      return d;
+    });
+  } catch (e) {
+    return res.status(409).json({ success: false, error: e.message });
+  }
+  invalidateUserDoc(req.uid);
+
+  // A Telegram outage must not fail the user's request (it is saved as PENDING).
+  try {
+    const messages = await sendRequestToBot(reqId, {
+      name: profile.profileName || '', uid: req.uid, email: profile.email || req.email, phone: profile.profilePhone || '',
+      role: roleOf(profile), balance: Number(profile.balance || 0), amount, methodLabel, txCode, date, ip,
+    });
+    if (messages.length) await idxRef.set({ messages }, { merge: true });
+  } catch (e) { console.warn('[topup-qr] announce failed:', e?.name || 'error'); }
+
+  res.json({ success: true, reqId, status: 'PENDING' });
+}));
+
+// GET /api/user/topup-history — the user's own top-up requests, newest first (safe display fields only).
+router.get('/topup-history', asyncHandler(async (req, res) => {
+  const snap = await getUserDoc(req.uid);
+  const list = snap.exists ? (snap.data.topupRequests || []) : [];
+  const payments = [...list].reverse().slice(0, 200).map((t) => ({
+    date: t.date || '', amount: Number(t.amount || 0), method: t.method || 'OTHER',
+    status: t.status || 'PENDING', txCode: t.txCode || '', reviewedAt: t.reviewedAt || '',
+  }));
+  res.json({ success: true, payments });
 }));
 
 // GET /api/user/balance-history — the user's own deposit/adjustment

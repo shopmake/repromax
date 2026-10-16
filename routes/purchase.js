@@ -18,6 +18,8 @@ import { telegramNotify, telegramFormat } from '../src/telegram.js';
 import { fetchRealKey, UpstreamError } from '../src/upstream.js';
 import { invalidateUserDoc } from '../src/userCache.js';
 import { leaderboardCache } from '../src/sharedCaches.js';
+import { roleOf } from '../src/roles.js';
+import { recordRevenue } from '../src/revenue.js';
 
 const router = express.Router();
 router.use(userCors);
@@ -65,7 +67,9 @@ router.post('/checkout/start', asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, error: 'Android ID contains invalid characters' });
   }
 
-  const product = await findProductFresh(sku);
+  const buyerSnap = await db().collection('users').doc(req.uid).get();
+  const buyerRole = roleOf(buyerSnap.exists ? buyerSnap.data() : {});
+  const product = await findProductFresh(sku, buyerRole);
   if (!product) return res.status(400).json({ success: false, error: 'Unknown product' });
 
   const blocked = await unavailableReason(product, sku, androidId);
@@ -182,7 +186,8 @@ async function runCheckoutJob(jobId, uid, email, sku, buyerName, buyerWa, androi
   setJob(jobId, { percent: 5, label: 'Checking request...' });
 
   try {
-    product = await findProductFresh(sku);
+    const roleSnap = await db().collection('users').doc(uid).get();
+    product = await findProductFresh(sku, roleOf(roleSnap.exists ? roleSnap.data() : {}));
     if (!product) throw new Error('Unknown product');
     price = Number(product.price);
 
@@ -239,6 +244,7 @@ async function runCheckoutJob(jobId, uid, email, sku, buyerName, buyerWa, androi
       telegramNotify(`🚨 <b>PURCHASE NOT SAVED — needs manual check</b>\nOrder: <code>${requestId}</code>\nUID: <code>${uid}</code>\nKey: <code>${key}</code>`);
     }
     settled = true;
+    recordRevenue(price, 1);
     invalidateUserDoc(uid);
     leaderboardCache.invalidate();
 

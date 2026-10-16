@@ -1,5 +1,6 @@
 import express from 'express';
 import crypto from 'crypto';
+import admin from 'firebase-admin';
 import { asyncHandler } from '../src/asyncHandler.js';
 import { db, requireAdmin, adminCors } from '../src/firebase.js';
 import { rateLimit } from '../src/security.js';
@@ -11,6 +12,9 @@ import { invalidateUserDoc, invalidateAllUserDocs } from '../src/userCache.js';
 import { announcementCache, policyCache, leaderboardCache } from '../src/sharedCaches.js';
 import { normalizeUrlField, RuleError } from '../src/profileRules.js';
 import { getStock, setStock } from '../src/gloryStock.js';
+import { ROLES, ROLE_LABEL, roleOf, roleChangeUpdate, resellerProgress, totalDeposited } from '../src/roles.js';
+import { BAN_DURATIONS, makeBan, activeBan } from '../src/ban.js';
+import { revenueWindows, backfillRevenue } from '../src/revenue.js';
 
 const router = express.Router();
 router.use(adminCors);
@@ -63,7 +67,26 @@ router.get('/lookup', asyncHandler(async (req, res) => {
     adminMessage: data.adminMessage || '',
     profileName: data.profileName || '',
     profilePhone: data.profilePhone || '',
+    role: roleOf(data),
+    resellerProgress: resellerProgress(data),
+    fakePayment: data.fakePayment || null,
+    ban: activeBan(data),
   });
+}));
+
+// POST /api/admin/set-role  { uid, role: "user" | "reseller" }
+router.post('/set-role', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  const role = String(req.body?.role || '').trim();
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+  if (!ROLES.includes(role)) return res.status(400).json({ success: false, error: 'role must be "user" or "reseller"' });
+  const userRef = db().collection('users').doc(uid);
+  const snap = await userRef.get();
+  if (!snap.exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
+  const upd = roleChangeUpdate(snap.data(), role, 'admin-panel');
+  await userRef.set({ ...upd.fields, adminLog: [...(snap.data().adminLog || []), ...upd.log] }, { merge: true });
+  invalidateUserDoc(uid);
+  res.json({ success: true, uid, role });
 }));
 
 // POST /api/admin/adjust-balance  { uid, amount, direction: "add"|"deduct", note }
@@ -93,7 +116,9 @@ router.post('/adjust-balance', asyncHandler(async (req, res) => {
       const log = snap.exists ? (snap.data().adminLog || []) : [];
       log.push({ delta, note, resultingBalance: updated, at: new Date().toISOString() });
 
-      tx.set(userRef, { balance: updated, adminLog: log }, { merge: true });
+      const upd = { balance: updated, adminLog: log };
+      if (delta > 0 && snap.exists) upd.totalDeposited = totalDeposited(snap.data()) + delta;
+      tx.set(userRef, upd, { merge: true });
       beforeBalance = current;
       userEmail = snap.exists ? (snap.data().email || '') : '';
       return updated;
@@ -185,6 +210,7 @@ router.post('/topup-review', asyncHandler(async (req, res) => {
         });
         update.balance = balance;
         update.adminLog = log;
+        update.totalDeposited = totalDeposited(data) + amount;
       }
 
       tx.set(userRef, update, { merge: true });
@@ -258,6 +284,7 @@ router.get('/products', asyncHandler(async (req, res) => {
     return {
       sku, pid: p.pid, row: p.row, name: p.name, duration: p.duration, image: p.image,
       price: p.price,
+      priceReseller: Number(p.priceReseller) > 0 ? Number(p.priceReseller) : null,
       downloadLink: p.downloadLink || '',
       tags: Array.isArray(p.tags) ? p.tags : [],
       maintenance: !!p.maintenance,
@@ -378,8 +405,11 @@ router.post('/products/create', asyncHandler(async (req, res) => {
     if (!name || !duration) return res.status(400).json({ success: false, error: `Duration #${i + 1}: name and duration label are required` });
     if (!price || price <= 0) return res.status(400).json({ success: false, error: `Duration #${i + 1}: price must be a positive number` });
 
+    const priceReseller = d?.priceReseller === undefined || d?.priceReseller === '' || d?.priceReseller === null ? 0 : Number(d.priceReseller);
+    if (priceReseller && priceReseller <= 0) return res.status(400).json({ success: false, error: `Duration #${i + 1}: reseller price must be a positive number` });
+
     const sku = `p_${pid}_${i + 1}_${Date.now().toString(36)}`;
-    const product = { pid, row, name, duration, price, image, tags, createdAt: Date.now(), ...(downloadLink ? { downloadLink } : {}) };
+    const product = { pid, row, name, duration, price, ...(priceReseller ? { priceReseller } : {}), image, tags, createdAt: Date.now(), ...(downloadLink ? { downloadLink } : {}) };
     batch.set(db().collection('products').doc(sku), product);
     created.push({ sku, ...product });
   }
@@ -407,6 +437,15 @@ router.post('/products/:sku/edit', asyncHandler(async (req, res) => {
     if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Price must be a positive number' });
     fields.price = v;
   }
+  let clearReseller = false;
+  if (req.body?.priceReseller !== undefined) {
+    if (req.body.priceReseller === '' || req.body.priceReseller === null) clearReseller = true;
+    else {
+      const v = Number(req.body.priceReseller);
+      if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Reseller price must be a positive number (or blank to remove it)' });
+      fields.priceReseller = v;
+    }
+  }
   if (req.body?.tags !== undefined) {
     const v = normalizeTags(req.body.tags);
     if (!v.length) return res.status(400).json({ success: false, error: `Select at least one tag (${VALID_TAGS.join(', ')})` });
@@ -421,11 +460,11 @@ router.post('/products/:sku/edit', asyncHandler(async (req, res) => {
       throw e;
     }
   }
-  if (!Object.keys(fields).length) return res.status(400).json({ success: false, error: 'Nothing to update' });
+  if (!Object.keys(fields).length && !clearReseller) return res.status(400).json({ success: false, error: 'Nothing to update' });
 
   if (!(await getProductRaw(sku))) return res.status(404).json({ success: false, error: 'Unknown sku' });
 
-  await db().collection('products').doc(sku).set(fields, { merge: true });
+  await db().collection('products').doc(sku).set({ ...fields, ...(clearReseller ? { priceReseller: admin.firestore.FieldValue.delete() } : {}) }, { merge: true });
   invalidateProductCache();
   res.json({ success: true, sku, updated: fields });
 }));
@@ -597,13 +636,26 @@ router.post('/redeem-codes/:code/deactivate', asyncHandler(async (req, res) => {
 // GET /api/admin/stats — headline numbers for the dashboard cards
 router.get('/stats', asyncHandler(async (req, res) => {
   const snap = await db().collection('users').get();
-  let totalRevenue = 0, totalKeysSold = 0;
+  let totalRevenue = 0, totalKeysSold = 0, totalBalance = 0, resellers = 0;
   snap.forEach((d) => {
     const data = d.data();
     totalRevenue += Number(data.totalSpent || 0);
     totalKeysSold += Number(data.totalKeysBought || 0);
+    totalBalance += Number(data.balance || 0);   // ALL USERS BALANCE
+    if (roleOf(data) === 'reseller') resellers += 1;
   });
-  res.json({ success: true, totalUsers: snap.size, totalRevenue, totalKeysSold });
+  let rev = { rev7: 0, rev30: 0, since: null };
+  try { rev = await revenueWindows(); } catch (e) { console.warn('[stats] revenue windows failed:', e?.message || e); }
+  res.json({
+    success: true, totalUsers: snap.size, totalRevenue, totalKeysSold,
+    totalBalance, resellers,
+    revenue7: rev.rev7, revenue30: rev.rev30, revenueSince: rev.since,
+  });
+}));
+
+// POST /api/admin/backfill-revenue — one-time rebuild of the 7/30-day numbers from past completed orders.
+router.post('/backfill-revenue', asyncHandler(async (req, res) => {
+  res.json({ success: true, ...(await backfillRevenue()) });
 }));
 
 // GET /api/admin/rankings — top users by spend
@@ -744,6 +796,9 @@ router.get('/users', asyncHandler(async (req, res) => {
       totalSpent: Number(d.totalSpent || 0),
       lastTopupAt,
       lastTopupAmount: lastTopup ? Number(lastTopup.amount || 0) : null,
+      role: roleOf(d),
+      totalDeposited: totalDeposited(d),
+      banned: !!activeBan(d),
     };
 
     if (q) {
@@ -808,6 +863,63 @@ router.post('/glory-stock', asyncHandler(async (req, res) => {
   const stock = await setStock({ enabled: req.body.enabled, total: Number.isInteger(total) ? total : 0 });
   telegramNotify(`🤖 <b>Glory Bot stock</b> set: ${stock.enabled ? `${stock.available} available of ${stock.total}` : 'unlimited'} (admin panel)`);
   res.json({ success: true, ...stock });
+}));
+
+
+// ---------------------------------------------------------------
+// Bans + fake-payment strikes (Khalti/eSewa top-ups cancelled from Telegram)
+// ---------------------------------------------------------------
+router.post('/ban', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  const duration = String(req.body?.duration || '').trim();
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+  if (!BAN_DURATIONS[duration]) return res.status(400).json({ success: false, error: `duration must be one of: ${Object.keys(BAN_DURATIONS).join(', ')}` });
+  const userRef = db().collection('users').doc(uid);
+  const snap = await userRef.get();
+  if (!snap.exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
+  const ban = makeBan(duration);
+  const d = snap.data();
+  const log = [...(d.adminLog || []), { delta: 0, note: `Banned — ${ban.label}`, resultingBalance: Number(d.balance || 0), at: new Date().toISOString() }];
+  await userRef.set({ ban, banned: true, adminLog: log }, { merge: true });
+  invalidateUserDoc(uid);
+  telegramNotify(`🚫 <b>User banned</b> — ${esc(ban.label)}\nUID: <code>${esc(uid)}</code>\n${esc(d.email || '')}`);
+  res.json({ success: true, uid, ban });
+}));
+
+router.post('/unban', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+  const userRef = db().collection('users').doc(uid);
+  const snap = await userRef.get();
+  if (!snap.exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
+  const d = snap.data();
+  const log = [...(d.adminLog || []), { delta: 0, note: 'Unbanned', resultingBalance: Number(d.balance || 0), at: new Date().toISOString() }];
+  await userRef.set({ ban: admin.firestore.FieldValue.delete(), banned: admin.firestore.FieldValue.delete(), adminLog: log }, { merge: true });
+  invalidateUserDoc(uid);
+  telegramNotify(`✅ <b>User unbanned</b>\nUID: <code>${esc(uid)}</code>\n${esc(d.email || '')}`);
+  res.json({ success: true, uid });
+}));
+
+router.post('/reset-fake-strikes', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+  const userRef = db().collection('users').doc(uid);
+  if (!(await userRef.get()).exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
+  await userRef.set({ fakePayment: admin.firestore.FieldValue.delete() }, { merge: true });
+  invalidateUserDoc(uid);
+  res.json({ success: true, uid });
+}));
+
+router.get('/banned', asyncHandler(async (req, res) => {
+  const q = await db().collection('users').where('banned', '==', true).limit(200).get();
+  const banned = [];
+  for (const doc of q.docs) {
+    const data = doc.data();
+    const ban = activeBan(data);
+    if (ban) banned.push({ uid: doc.id, email: data.email || '', profileName: data.profileName || '', ...ban });
+  }
+  banned.sort((a, b) => (b.at || 0) - (a.at || 0));
+  res.json({ success: true, banned });
 }));
 
 export default router;

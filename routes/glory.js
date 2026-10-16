@@ -1,4 +1,5 @@
 import express from 'express';
+import { recordRevenue } from '../src/revenue.js';
 import admin from 'firebase-admin';
 import { asyncHandler } from '../src/asyncHandler.js';
 import { db, requireFirebaseUid, userCors } from '../src/firebase.js';
@@ -388,8 +389,10 @@ router.post('/launch', rateLimit({ windowMs: 60_000, max: 6, name: 'glory-launch
       });
     }
     invalidateUserDoc(req.uid);
+    recordRevenue(price);
 
     const refund = async () => {
+      recordRevenue(-price);
       await userRef.set({
         balance: admin.firestore.FieldValue.increment(price),
         totalSpent: admin.firestore.FieldValue.increment(-price),
