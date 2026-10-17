@@ -110,3 +110,13 @@ services:
         sync: false
       - key: RESELLER_ENDPOINT
         value: https://repromax5.onrender.com/api/reseller/v1
+
+      # ---- Telegram admin bot (QR top-up Load/Cancel + /loadbalance, /getinfo, /mode, /creategift ...) ----
+      - key: TELEGRAM_TOPUP_AUTO_BOT
+        sync: false
+      - key: TELEGRAM_TOPUP_AUTO_CHAT_ID
+        sync: false
+      - key: TELEGRAM_TOPUP_ADMIN_IDS
+        sync: false
+      - key: PUBLIC_BACKEND_URL
+        sync: false
