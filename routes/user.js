@@ -14,8 +14,11 @@ import {
 } from '../src/profileRules.js';
 import { getUserDoc, invalidateUserDoc } from '../src/userCache.js';
 import { rateLimit } from '../src/security.js';
-import { roleOf, resellerProgress, roleChangeUpdate } from '../src/roles.js';
-import { QR_MIN_AMOUNT, QR_MAX_AMOUNT, QR_MAX_PENDING, QR_PENDING_WINDOW_MS, QR_METHODS, newReqId, sendRequestToBot } from '../src/topupQr.js';
+import { roleOf, resellerProgress, RESELLER_MIN_KEYS, RESELLER_MIN_BALANCE } from '../src/roles.js';
+import {
+  QR_MIN_AMOUNT, QR_MAX_AMOUNT, QR_MAX_PENDING, QR_PENDING_WINDOW_MS, QR_METHOD, WALLETS,
+  newReqId, sendRequestToBot,
+} from '../src/topupBot.js';
 
 const router = express.Router();
 router.use(userCors);
@@ -29,6 +32,7 @@ const DEFAULTS = (email) => ({
   tiktokUser: '',
   avatarUrl: '',
   requestStatus: 'Active',
+  role: 'user', // 'user' | 'reseller' — changed by the owner (Telegram /mode, admin panel) or by the user once eligible
   adminMessage: `Welcome to ${STORE_NAME}! Add balance to get your key 🔑`,
   balance: 0,
   purchaseHistory: [],
@@ -94,6 +98,7 @@ router.get('/me', asyncHandler(async (req, res) => {
     totalSpent: Number(data.totalSpent || 0),
     totalKeysBought: Number(data.totalKeysBought || 0),
     requestStatus: data.requestStatus || 'Active',
+    role: roleOf(data),
   });
 }));
 
@@ -122,6 +127,9 @@ router.get('/balance', asyncHandler(async (req, res) => {
     profileLocks: computeLocks(data),
     profileLimits: LIMITS_MS,
     email: data.email || req.email,
+    role: roleOf(data),
+    minKeys: RESELLER_MIN_KEYS,
+    minBalance: RESELLER_MIN_BALANCE,
     totalKeysBought: Number(data.totalKeysBought || 0),
     totalSpent: Number(data.totalSpent || 0),
     hasCompletedFirstTopup: (data.topupRequests || []).some((t) => t.status === 'APPROVED'),
@@ -130,21 +138,17 @@ router.get('/balance', asyncHandler(async (req, res) => {
     // dashboard modal.
     avatarUrl: data.avatarUrl || '',
     policyAcknowledged: !!data.policyAcknowledged,
-    // Mode ('user' | 'reseller') + progress toward the reseller requirement (8 keys + NRP 1500 deposited).
-    role: roleOf(data),
-    resellerProgress: resellerProgress(data),
-    // Fake-payment strikes from cancelled Khalti/eSewa top-ups (null = clean account).
-    fakePayment: data.fakePayment && data.fakePayment.count
-      ? { count: Number(data.fakePayment.count), max: 3, text: data.fakePayment.text || '', lastTx: data.fakePayment.lastTx || '', lastAt: data.fakePayment.lastAt || '' }
-      : null,
   });
 }));
 
-// GET /api/user/catalog — the catalog priced for THIS account's mode (user / reseller).
-// Prices are re-read server-side at checkout regardless.
+// GET /api/user/catalog — the one catalog every account sees (single price
+// list, no roles). Prices are re-read server-side at checkout regardless.
 router.get('/catalog', asyncHandler(async (req, res) => {
+  // The price each account sees is its own: resellers get priceReseller where the admin set one.
+  // Role is read from Firestore (cached ~1 min, invalidated on every change), never from the client.
   const snap = await getUserDoc(req.uid);
-  res.json({ success: true, role: roleOf(snap.exists ? snap.data : {}), catalog: await getLiveCatalog(roleOf(snap.exists ? snap.data : {})) });
+  const role = snap.exists ? roleOf(snap.data) : 'user';
+  res.json({ success: true, role, catalog: await getLiveCatalog(role) });
 }));
 
 // POST /api/user/profile
@@ -258,26 +262,25 @@ router.post('/topup', asyncHandler(async (req,res)=>{
   } catch(e) { res.status(409).json({success:false,error:e.message}); }
 }));
 
-// POST /api/user/topup-qr { amount, txCode, method: 'khalti' | 'esewa' }
-// User paid the Khalti or eSewa QR and now sends the transaction ID. We store a PENDING
-// request, then post it to the owner's Telegram bot with [Load ✅] [Cancel ❌].
-// Load credits the balance; Cancel counts as a fake-payment strike (see src/topupQr.js).
+// POST /api/user/topup-qr { amount, txCode, wallet: 'khalti' | 'esewa' }
+// The user paid one of the store's QR codes and sends the transaction ID. A PENDING request is
+// saved and posted to the owner's Telegram bot with [Load ✅] / [Cancel ❌] (src/topupBot.js).
 router.post('/topup-qr', rateLimit({ windowMs: 10 * 60_000, max: 8, name: 'topup-qr' }), asyncHandler(async (req, res) => {
   const amount = Number(req.body?.amount);
   const txCode = String(req.body?.txCode || '').trim().toUpperCase();
-  const method = String(req.body?.method || '').trim().toLowerCase();
-  const methodLabel = QR_METHODS[method];
-  if (!methodLabel) return res.status(400).json({ success: false, error: 'Choose Khalti or eSewa' });
+  const wallet = String(req.body?.wallet || '').trim().toLowerCase();
+  if (!WALLETS[wallet]) return res.status(400).json({ success: false, error: 'Choose Khalti or eSewa / PhonePay' });
   if (!Number.isInteger(amount) || amount < QR_MIN_AMOUNT) return res.status(400).json({ success: false, error: `Minimum top-up is Rs ${QR_MIN_AMOUNT}` });
   if (amount > QR_MAX_AMOUNT) return res.status(400).json({ success: false, error: 'Amount is too large' });
   if (!/^[A-Z0-9_-]{6,40}$/.test(txCode)) return res.status(400).json({ success: false, error: 'Enter a valid transaction ID (6-40 letters/numbers)' });
 
   const reqId = newReqId();
   const userRef = db().collection('users').doc(req.uid);
-  const txRef = db().collection('topupTx').doc(txCode);      // one transaction ID can only ever be used once, across ALL accounts
+  const txRef = db().collection('topupTx').doc(txCode);   // one transaction ID can only be used once, across ALL accounts
   const idxRef = db().collection('topupQr').doc(reqId);
   const date = new Date().toISOString();
   const ip = req.ip || '';
+  const walletLabel = WALLETS[wallet].label;
 
   let profile;
   try {
@@ -286,17 +289,18 @@ router.post('/topup-qr', rateLimit({ windowMs: 10 * 60_000, max: 8, name: 'topup
       if (used.exists) throw new Error('This transaction ID was already submitted');
       const d = u.exists ? u.data() : {};
       const list = Array.isArray(d.topupRequests) ? d.topupRequests : [];
+      // Only RECENT QR requests count towards the limit; old unreviewed entries must not block new top-ups.
       const recentCut = Date.now() - QR_PENDING_WINDOW_MS;
-      const recentPending = list.filter((t) => t.status === 'PENDING' && QR_METHODS[String(t.method || '').toLowerCase()] && new Date(t.date).getTime() > recentCut);
-      if (recentPending.length >= QR_MAX_PENDING) {
-        const oldest = Math.min(...recentPending.map((t) => new Date(t.date).getTime()));
+      const recent = list.filter((t) => t.status === 'PENDING' && t.method === QR_METHOD && new Date(t.date).getTime() > recentCut);
+      if (recent.length >= QR_MAX_PENDING) {
+        const oldest = Math.min(...recent.map((t) => new Date(t.date).getTime()));
         const mins = Math.max(1, Math.ceil((oldest + QR_PENDING_WINDOW_MS - Date.now()) / 60000));
-        throw new Error(`You already have ${recentPending.length} top-ups waiting to be checked. You can send a new one in about ${mins} min.`);
+        throw new Error(`You already have ${recent.length} top-ups waiting to be checked. You can send a new one in about ${mins} min.`);
       }
-      const entry = { date, amount, paymentAccount: `${methodLabel} QR (${STORE_NAME})`, method: methodLabel, txCode, status: 'PENDING', uid: req.uid, email: req.email, reqId, ip };
+      const entry = { date, amount, paymentAccount: `${walletLabel} QR (${STORE_NAME})`, method: QR_METHOD, wallet, txCode, status: 'PENDING', uid: req.uid, email: req.email, reqId, ip };
       tx.set(userRef, { topupRequests: [...list, entry] }, { merge: true });
       tx.set(txRef, { uid: req.uid, reqId, at: date });
-      tx.set(idxRef, { uid: req.uid, txCode, amount, method: methodLabel, status: 'PENDING', createdAt: date, messages: [] });
+      tx.set(idxRef, { uid: req.uid, txCode, amount, wallet, status: 'PENDING', createdAt: date, messages: [] });
       return d;
     });
   } catch (e) {
@@ -304,11 +308,11 @@ router.post('/topup-qr', rateLimit({ windowMs: 10 * 60_000, max: 8, name: 'topup
   }
   invalidateUserDoc(req.uid);
 
-  // A Telegram outage must not fail the user's request (it is saved as PENDING).
+  // A Telegram outage must not fail the request: it is saved as PENDING and visible in the admin panel too.
   try {
     const messages = await sendRequestToBot(reqId, {
       name: profile.profileName || '', uid: req.uid, email: profile.email || req.email, phone: profile.profilePhone || '',
-      role: roleOf(profile), balance: Number(profile.balance || 0), amount, methodLabel, txCode, date, ip,
+      role: roleOf(profile), balance: Number(profile.balance || 0), amount, walletLabel, txCode, date, ip,
     });
     if (messages.length) await idxRef.set({ messages }, { merge: true });
   } catch (e) { console.warn('[topup-qr] announce failed:', e?.name || 'error'); }
@@ -316,39 +320,34 @@ router.post('/topup-qr', rateLimit({ windowMs: 10 * 60_000, max: 8, name: 'topup
   res.json({ success: true, reqId, status: 'PENDING' });
 }));
 
-// POST /api/user/upgrade-reseller — user -> reseller, only when the requirement is met
-// (8 keys bought + NRP 1500 deposited). Checked inside a transaction on the server.
-router.post('/upgrade-reseller', rateLimit({ windowMs: 10 * 60_000, max: 10, name: 'upgrade-reseller' }), asyncHandler(async (req, res) => {
+// ---------------------------------------------------------------
+// Reseller self-upgrade — 8+ keys bought AND balance >= NRP 1500.
+// Both numbers are re-checked here against Firestore; the client is never trusted.
+// ---------------------------------------------------------------
+router.post('/apply-reseller', asyncHandler(async (req, res) => {
   const userRef = db().collection('users').doc(req.uid);
-  try {
-    const out = await db().runTransaction(async (tx) => {
-      const snap = await tx.get(userRef);
-      if (!snap.exists) throw new Error('Account not found');
-      const d = snap.data();
-      if (roleOf(d) === 'reseller') throw new Error('You are already a reseller');
-      const rp = resellerProgress(d);
-      if (!rp.eligible) throw new Error(`Not yet: you need ${rp.requiredKeys} keys bought (${rp.keys} now) and NRP ${rp.requiredDeposit} deposited (NRP ${rp.deposited} now).`);
-      const upd = roleChangeUpdate(d, 'reseller', 'self-upgrade');
-      tx.set(userRef, { ...upd.fields, adminLog: [...(d.adminLog || []), ...upd.log] }, { merge: true });
-      return rp;
-    });
-    invalidateUserDoc(req.uid);
-    telegramNotify(`🛒 <b>New RESELLER</b> (self-upgrade)\nUID: <code>${esc(req.uid)}</code>\n${esc(req.email)}`);
-    res.json({ success: true, role: 'reseller', resellerProgress: out });
-  } catch (e) {
-    res.status(400).json({ success: false, error: e.message });
-  }
+  const result = await db().runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() : {};
+    if (roleOf(data) === 'reseller') return { ok: false, error: 'You are already a reseller' };
+    const pr = resellerProgress(data);
+    if (!pr.eligible) {
+      return { ok: false, error: `Not eligible yet — need ${RESELLER_MIN_KEYS}+ keys bought (you have ${pr.totalKeysBought}) and NRP ${RESELLER_MIN_BALANCE}+ balance (you have NRP ${pr.balance}).` };
+    }
+    const log = [...(data.adminLog || []), { delta: 0, note: `Self-upgraded to reseller (${pr.totalKeysBought} keys, NRP ${pr.balance} balance)`, resultingBalance: pr.balance, at: new Date().toISOString() }];
+    tx.set(userRef, { role: 'reseller', adminLog: log }, { merge: true });
+    return { ok: true, ...pr };
+  });
+  if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+  invalidateUserDoc(req.uid);
+  telegramNotify(`👑 <b>RESELLER SELF-UPGRADE</b>\nUID: <code>${esc(req.uid)}</code>\nEmail: ${esc(req.email)}\nKeys bought: ${result.totalKeysBought}\nBalance: NRP ${result.balance}`);
+  res.json({ success: true, role: 'reseller' });
 }));
 
-// GET /api/user/topup-history — the user's own top-up requests, newest first (safe display fields only).
-router.get('/topup-history', asyncHandler(async (req, res) => {
+// GET /api/user/reseller-progress — numbers for the dashboard progress bars (display only).
+router.get('/reseller-progress', asyncHandler(async (req, res) => {
   const snap = await getUserDoc(req.uid);
-  const list = snap.exists ? (snap.data.topupRequests || []) : [];
-  const payments = [...list].reverse().slice(0, 200).map((t) => ({
-    date: t.date || '', amount: Number(t.amount || 0), method: t.method || 'OTHER',
-    status: t.status || 'PENDING', txCode: t.txCode || '', reviewedAt: t.reviewedAt || '',
-  }));
-  res.json({ success: true, payments });
+  res.json({ success: true, ...resellerProgress(snap.exists ? snap.data : {}) });
 }));
 
 // GET /api/user/balance-history — the user's own deposit/adjustment

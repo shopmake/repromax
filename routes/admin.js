@@ -1,6 +1,5 @@
 import express from 'express';
 import crypto from 'crypto';
-import admin from 'firebase-admin';
 import { asyncHandler } from '../src/asyncHandler.js';
 import { db, requireAdmin, adminCors } from '../src/firebase.js';
 import { rateLimit } from '../src/security.js';
@@ -12,9 +11,9 @@ import { invalidateUserDoc, invalidateAllUserDocs } from '../src/userCache.js';
 import { announcementCache, policyCache, leaderboardCache } from '../src/sharedCaches.js';
 import { normalizeUrlField, RuleError } from '../src/profileRules.js';
 import { getStock, setStock } from '../src/gloryStock.js';
-import { ROLES, ROLE_LABEL, roleOf, roleChangeUpdate, resellerProgress, totalDeposited } from '../src/roles.js';
-import { BAN_DURATIONS, makeBan, activeBan } from '../src/ban.js';
-import { revenueWindows, backfillRevenue } from '../src/revenue.js';
+import { createRedeemCodeDoc } from '../src/giftCodes.js';
+import { computeStats } from '../src/stats.js';
+import { normalizeRole, roleChangeUpdate, roleOf } from '../src/roles.js';
 
 const router = express.Router();
 router.use(adminCors);
@@ -60,6 +59,7 @@ router.get('/lookup', asyncHandler(async (req, res) => {
     success: true, uid, found: true,
     balance: Number(data.balance || 0),
     email: data.email || '',
+    role: roleOf(data),
     adminLog: [...(data.adminLog || [])].reverse().slice(0, 50),
     purchases: [...(data.purchaseHistory || [])].reverse().slice(0, 50),
     topupRequests: [...(data.topupRequests || [])].reverse().slice(0, 50),
@@ -67,26 +67,7 @@ router.get('/lookup', asyncHandler(async (req, res) => {
     adminMessage: data.adminMessage || '',
     profileName: data.profileName || '',
     profilePhone: data.profilePhone || '',
-    role: roleOf(data),
-    resellerProgress: resellerProgress(data),
-    fakePayment: data.fakePayment || null,
-    ban: activeBan(data),
   });
-}));
-
-// POST /api/admin/set-role  { uid, role: "user" | "reseller" }
-router.post('/set-role', asyncHandler(async (req, res) => {
-  const uid = String(req.body?.uid || '').trim();
-  const role = String(req.body?.role || '').trim();
-  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
-  if (!ROLES.includes(role)) return res.status(400).json({ success: false, error: 'role must be "user" or "reseller"' });
-  const userRef = db().collection('users').doc(uid);
-  const snap = await userRef.get();
-  if (!snap.exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
-  const upd = roleChangeUpdate(snap.data(), role, 'admin-panel');
-  await userRef.set({ ...upd.fields, adminLog: [...(snap.data().adminLog || []), ...upd.log] }, { merge: true });
-  invalidateUserDoc(uid);
-  res.json({ success: true, uid, role });
 }));
 
 // POST /api/admin/adjust-balance  { uid, amount, direction: "add"|"deduct", note }
@@ -116,9 +97,7 @@ router.post('/adjust-balance', asyncHandler(async (req, res) => {
       const log = snap.exists ? (snap.data().adminLog || []) : [];
       log.push({ delta, note, resultingBalance: updated, at: new Date().toISOString() });
 
-      const upd = { balance: updated, adminLog: log };
-      if (delta > 0 && snap.exists) upd.totalDeposited = totalDeposited(snap.data()) + delta;
-      tx.set(userRef, upd, { merge: true });
+      tx.set(userRef, { balance: updated, adminLog: log }, { merge: true });
       beforeBalance = current;
       userEmail = snap.exists ? (snap.data().email || '') : '';
       return updated;
@@ -210,7 +189,6 @@ router.post('/topup-review', asyncHandler(async (req, res) => {
         });
         update.balance = balance;
         update.adminLog = log;
-        update.totalDeposited = totalDeposited(data) + amount;
       }
 
       tx.set(userRef, update, { merge: true });
@@ -276,7 +254,7 @@ router.post('/backfill-stats', asyncHandler(async (req, res) => {
 // GET /api/admin/products — every product with its current live
 // maintenance/stock status, for the admin panel's product manager.
 router.get('/products', asyncHandler(async (req, res) => {
-  const liveCatalog = await getLiveCatalog();
+  const liveCatalog = await getLiveCatalog('admin');
   const skus = Object.keys(liveCatalog).filter((sku) => liveCatalog[sku].type !== 'whatsapp'); // chat-to-buy products have their own list below
 
   const products = skus.map((sku) => {
@@ -284,7 +262,7 @@ router.get('/products', asyncHandler(async (req, res) => {
     return {
       sku, pid: p.pid, row: p.row, name: p.name, duration: p.duration, image: p.image,
       price: p.price,
-      priceReseller: Number(p.priceReseller) > 0 ? Number(p.priceReseller) : null,
+      priceReseller: Number(p.priceReseller) > 0 ? Number(p.priceReseller) : p.price,
       downloadLink: p.downloadLink || '',
       tags: Array.isArray(p.tags) ? p.tags : [],
       maintenance: !!p.maintenance,
@@ -402,14 +380,13 @@ router.post('/products/create', asyncHandler(async (req, res) => {
     const name = String(d?.name || '').trim();
     const duration = String(d?.duration || '').trim();
     const price = Number(d?.price);
+    const priceReseller = Number(d?.priceReseller);
     if (!name || !duration) return res.status(400).json({ success: false, error: `Duration #${i + 1}: name and duration label are required` });
     if (!price || price <= 0) return res.status(400).json({ success: false, error: `Duration #${i + 1}: price must be a positive number` });
-
-    const priceReseller = d?.priceReseller === undefined || d?.priceReseller === '' || d?.priceReseller === null ? 0 : Number(d.priceReseller);
-    if (priceReseller && priceReseller <= 0) return res.status(400).json({ success: false, error: `Duration #${i + 1}: reseller price must be a positive number` });
+    if (d?.priceReseller !== undefined && d.priceReseller !== '' && !(priceReseller > 0)) return res.status(400).json({ success: false, error: `Duration #${i + 1}: reseller price must be a positive number` });
 
     const sku = `p_${pid}_${i + 1}_${Date.now().toString(36)}`;
-    const product = { pid, row, name, duration, price, ...(priceReseller ? { priceReseller } : {}), image, tags, createdAt: Date.now(), ...(downloadLink ? { downloadLink } : {}) };
+    const product = { pid, row, name, duration, price, ...(priceReseller > 0 ? { priceReseller } : {}), image, tags, createdAt: Date.now(), ...(downloadLink ? { downloadLink } : {}) };
     batch.set(db().collection('products').doc(sku), product);
     created.push({ sku, ...product });
   }
@@ -437,14 +414,10 @@ router.post('/products/:sku/edit', asyncHandler(async (req, res) => {
     if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Price must be a positive number' });
     fields.price = v;
   }
-  let clearReseller = false;
   if (req.body?.priceReseller !== undefined) {
-    if (req.body.priceReseller === '' || req.body.priceReseller === null) clearReseller = true;
-    else {
-      const v = Number(req.body.priceReseller);
-      if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Reseller price must be a positive number (or blank to remove it)' });
-      fields.priceReseller = v;
-    }
+    const v = Number(req.body.priceReseller);
+    if (!v || v <= 0) return res.status(400).json({ success: false, error: 'Reseller price must be a positive number' });
+    fields.priceReseller = v;
   }
   if (req.body?.tags !== undefined) {
     const v = normalizeTags(req.body.tags);
@@ -460,11 +433,11 @@ router.post('/products/:sku/edit', asyncHandler(async (req, res) => {
       throw e;
     }
   }
-  if (!Object.keys(fields).length && !clearReseller) return res.status(400).json({ success: false, error: 'Nothing to update' });
+  if (!Object.keys(fields).length) return res.status(400).json({ success: false, error: 'Nothing to update' });
 
   if (!(await getProductRaw(sku))) return res.status(404).json({ success: false, error: 'Unknown sku' });
 
-  await db().collection('products').doc(sku).set({ ...fields, ...(clearReseller ? { priceReseller: admin.firestore.FieldValue.delete() } : {}) }, { merge: true });
+  await db().collection('products').doc(sku).set(fields, { merge: true });
   invalidateProductCache();
   res.json({ success: true, sku, updated: fields });
 }));
@@ -551,52 +524,6 @@ router.post('/products/whatsapp/:id/delete', asyncHandler(async (req, res) => {
 // the code itself. Redemption itself happens via POST /api/user/redeem.
 // ---------------------------------------------------------------
 
-function generateRedeemCode() {
-  // GIFT_XXXXX_YYYYY — two 5-char groups, no 0/O/1/I to avoid confusion.
-  // Change the GIFT part with the CODE_PREFIX environment variable.
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const group = (n) => Array.from({ length: n }, () => chars[crypto.randomInt(chars.length)]).join('');
-  const prefix = String(process.env.CODE_PREFIX || 'GIFT').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'GIFT';
-  return `${prefix}_${group(5)}_${group(5)}`;
-}
-
-// Shared by POST /redeem-codes and the announcement gift flow below, so a
-// gift attached to a broadcast is a completely normal redeem code — same
-// validation, same collection, same redemption path.
-async function createRedeemCodeDoc({ amount, maxUses, expiresAt, code }) {
-  amount = Number(amount);
-  if (!amount || amount <= 0) throw Object.assign(new Error('Amount must be a positive number'), { status: 400 });
-
-  if (maxUses === '' || maxUses === undefined || maxUses === null || String(maxUses).toLowerCase() === 'unlimited') {
-    maxUses = null;
-  } else {
-    maxUses = Number(maxUses);
-    if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100) {
-      throw Object.assign(new Error('Max uses must be a whole number between 1 and 100, or unlimited'), { status: 400 });
-    }
-  }
-
-  let expiresAtMs = null;
-  if (expiresAt && String(expiresAt).toLowerCase() !== 'unlimited') {
-    const t = new Date(expiresAt).getTime();
-    if (Number.isNaN(t)) throw Object.assign(new Error('Invalid expiry date'), { status: 400 });
-    expiresAtMs = t;
-  }
-
-  const finalCode = String(code || '').trim().toUpperCase() || generateRedeemCode();
-  const ref = db().collection('redeemCodes').doc(finalCode);
-  const existing = await ref.get();
-  if (existing.exists) throw Object.assign(new Error('That code already exists'), { status: 409 });
-
-  const docData = {
-    code: finalCode, amount, maxUses, expiresAt: expiresAtMs,
-    active: true, usedCount: 0, redeemedBy: [],
-    createdAt: Date.now(),
-  };
-  await ref.set(docData);
-  return docData;
-}
-
 // POST /api/admin/redeem-codes
 // Body: { amount, maxUses (1-100, or null/omit for unlimited), expiresAt (ISO date string, or null/omit for unlimited), code (optional custom code) }
 router.post('/redeem-codes', asyncHandler(async (req, res) => {
@@ -635,32 +562,30 @@ router.post('/redeem-codes/:code/deactivate', asyncHandler(async (req, res) => {
 
 // GET /api/admin/stats — headline numbers for the dashboard cards
 router.get('/stats', asyncHandler(async (req, res) => {
-  const snap = await db().collection('users').get();
-  let totalRevenue = 0, totalKeysSold = 0, totalBalance = 0, resellers = 0;
-  snap.forEach((d) => {
-    const data = d.data();
-    totalRevenue += Number(data.totalSpent || 0);
-    totalKeysSold += Number(data.totalKeysBought || 0);
-    totalBalance += Number(data.balance || 0);   // ALL USERS BALANCE
-    if (roleOf(data) === 'reseller') resellers += 1;
-  });
-  let rev = { rev7: 0, rev30: 0, since: null };
-  try { rev = await revenueWindows(); } catch (e) { console.warn('[stats] revenue windows failed:', e?.message || e); }
-  res.json({
-    success: true, totalUsers: snap.size, totalRevenue, totalKeysSold,
-    totalBalance, resellers,
-    revenue7: rev.rev7, revenue30: rev.rev30, revenueSince: rev.since,
-  });
+  // totalBalance = every user's available balance added up; revenue7d / revenue30d come
+  // from completed orders (see src/stats.js). Old panels that only read the first three
+  // fields keep working.
+  res.json({ success: true, ...(await computeStats({ fresh: req.query.fresh === '1' })) });
 }));
 
-// POST /api/admin/backfill-revenue — one-time rebuild of the 7/30-day numbers from past completed orders.
-router.post('/backfill-revenue', asyncHandler(async (req, res) => {
+// POST /api/admin/set-role  { uid, role: "user"|"reseller" }  — the panel's Role manager
+router.post('/set-role', asyncHandler(async (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  const role = normalizeRole(req.body?.role);
+  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
+  if (!role) return res.status(400).json({ success: false, error: 'role must be "user" or "reseller"' });
+  const userRef = db().collection('users').doc(uid);
   try {
-    res.json({ success: true, ...(await backfillRevenue()) });
-  } catch (e) {
-    console.error('[backfill-revenue] failed:', e);
-    res.status(500).json({ success: false, error: `Rebuild failed: ${String(e?.message || e).slice(0, 200)}` });
-  }
+    await db().runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) throw new Error('User not found');
+      const d = snap.data();
+      const upd = roleChangeUpdate(d, role, 'admin-panel');
+      tx.set(userRef, { ...upd.fields, adminLog: [...(d.adminLog || []), ...upd.log] }, { merge: true });
+    });
+  } catch (e) { return res.status(400).json({ success: false, error: e.message }); }
+  invalidateUserDoc(uid);
+  res.json({ success: true, uid, role });
 }));
 
 // GET /api/admin/rankings — top users by spend
@@ -672,6 +597,7 @@ router.get('/rankings', asyncHandler(async (req, res) => {
       uid: d.id,
       email: data.email || '',
       profileName: data.profileName || '',
+      role: roleOf(data),
       balance: Number(data.balance || 0),
       totalSpent: Number(data.totalSpent || 0),
       totalKeysBought: Number(data.totalKeysBought || 0),
@@ -796,14 +722,12 @@ router.get('/users', asyncHandler(async (req, res) => {
       name: d.profileName || (d.email ? d.email.split('@')[0] : 'Unknown'),
       whatsapp: d.profilePhone || '',
       email: d.email || '',
+      role: roleOf(d),
       balance: Number(d.balance || 0),
       totalKeysBought: Number(d.totalKeysBought || 0),
       totalSpent: Number(d.totalSpent || 0),
       lastTopupAt,
       lastTopupAmount: lastTopup ? Number(lastTopup.amount || 0) : null,
-      role: roleOf(d),
-      totalDeposited: totalDeposited(d),
-      banned: !!activeBan(d),
     };
 
     if (q) {
@@ -868,63 +792,6 @@ router.post('/glory-stock', asyncHandler(async (req, res) => {
   const stock = await setStock({ enabled: req.body.enabled, total: Number.isInteger(total) ? total : 0 });
   telegramNotify(`🤖 <b>Glory Bot stock</b> set: ${stock.enabled ? `${stock.available} available of ${stock.total}` : 'unlimited'} (admin panel)`);
   res.json({ success: true, ...stock });
-}));
-
-
-// ---------------------------------------------------------------
-// Bans + fake-payment strikes (Khalti/eSewa top-ups cancelled from Telegram)
-// ---------------------------------------------------------------
-router.post('/ban', asyncHandler(async (req, res) => {
-  const uid = String(req.body?.uid || '').trim();
-  const duration = String(req.body?.duration || '').trim();
-  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
-  if (!BAN_DURATIONS[duration]) return res.status(400).json({ success: false, error: `duration must be one of: ${Object.keys(BAN_DURATIONS).join(', ')}` });
-  const userRef = db().collection('users').doc(uid);
-  const snap = await userRef.get();
-  if (!snap.exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
-  const ban = makeBan(duration);
-  const d = snap.data();
-  const log = [...(d.adminLog || []), { delta: 0, note: `Banned — ${ban.label}`, resultingBalance: Number(d.balance || 0), at: new Date().toISOString() }];
-  await userRef.set({ ban, banned: true, adminLog: log }, { merge: true });
-  invalidateUserDoc(uid);
-  telegramNotify(`🚫 <b>User banned</b> — ${esc(ban.label)}\nUID: <code>${esc(uid)}</code>\n${esc(d.email || '')}`);
-  res.json({ success: true, uid, ban });
-}));
-
-router.post('/unban', asyncHandler(async (req, res) => {
-  const uid = String(req.body?.uid || '').trim();
-  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
-  const userRef = db().collection('users').doc(uid);
-  const snap = await userRef.get();
-  if (!snap.exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
-  const d = snap.data();
-  const log = [...(d.adminLog || []), { delta: 0, note: 'Unbanned', resultingBalance: Number(d.balance || 0), at: new Date().toISOString() }];
-  await userRef.set({ ban: admin.firestore.FieldValue.delete(), banned: admin.firestore.FieldValue.delete(), adminLog: log }, { merge: true });
-  invalidateUserDoc(uid);
-  telegramNotify(`✅ <b>User unbanned</b>\nUID: <code>${esc(uid)}</code>\n${esc(d.email || '')}`);
-  res.json({ success: true, uid });
-}));
-
-router.post('/reset-fake-strikes', asyncHandler(async (req, res) => {
-  const uid = String(req.body?.uid || '').trim();
-  if (!uid) return res.status(400).json({ success: false, error: 'Provide a uid' });
-  const userRef = db().collection('users').doc(uid);
-  if (!(await userRef.get()).exists) return res.status(404).json({ success: false, error: 'No user found with that uid' });
-  await userRef.set({ fakePayment: admin.firestore.FieldValue.delete() }, { merge: true });
-  invalidateUserDoc(uid);
-  res.json({ success: true, uid });
-}));
-
-router.get('/banned', asyncHandler(async (req, res) => {
-  const q = await db().collection('users').where('banned', '==', true).limit(200).get();
-  const banned = [];
-  for (const doc of q.docs) {
-    const data = doc.data();
-    const ban = activeBan(data);
-    if (ban) banned.push({ uid: doc.id, email: data.email || '', profileName: data.profileName || '', ...ban });
-  }
-  banned.sort((a, b) => (b.at || 0) - (a.at || 0));
-  res.json({ success: true, banned });
 }));
 
 export default router;
