@@ -1,11 +1,12 @@
-// src/giftCodes.js — gift / redeem codes. Same documents the admin panel's
-// "redeem codes" tab creates (redeemCodes/{CODE}); users redeem them with
-// POST /api/user/redeem. Telegram /creategiftcards uses this too.
+// src/giftCodes.js — gift / promo (redeem) codes. ONE implementation shared by
+// the admin panel (POST /api/admin/redeem-codes), announcements with a gift,
+// and the Telegram bot's /creategift command.
 import crypto from 'crypto';
 import { db } from './firebase.js';
 
 export function generateRedeemCode() {
-  // GIFT_XXXXX_YYYYY — no 0/O/1/I to avoid confusion. Change GIFT with CODE_PREFIX.
+  // GIFT_XXXXX_YYYYY — two 5-char groups, no 0/O/1/I to avoid confusion.
+  // Change the GIFT part with the CODE_PREFIX environment variable.
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const group = (n) => Array.from({ length: n }, () => chars[crypto.randomInt(chars.length)]).join('');
   const prefix = String(process.env.CODE_PREFIX || 'GIFT').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'GIFT';
@@ -38,7 +39,8 @@ export async function createRedeemCodeDoc({ amount, maxUses, expiresAt, code }) 
 
   const docData = {
     code: finalCode, amount, maxUses, expiresAt: expiresAtMs,
-    active: true, usedCount: 0, redeemedBy: [], createdAt: Date.now(),
+    active: true, usedCount: 0, redeemedBy: [],
+    createdAt: Date.now(),
   };
   await ref.set(docData);
   return docData;

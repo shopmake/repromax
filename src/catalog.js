@@ -1,4 +1,4 @@
-// src/catalog.js — the product catalog. Two price lists: user (price) and reseller (priceReseller, falls back to price).
+// src/catalog.js — the product catalog. ONE price list for everyone (no roles).
 //
 // Products live in Firestore (`products/{sku}`), added from the admin panel,
 // so adding or editing a product never needs a code deploy. The `products`
@@ -51,11 +51,10 @@ const products = cachedLoader(async () => {
 export function invalidateProductCache() { products.invalidate(); }
 
 /** Fresh read of one product — used at checkout so the price and pid are never stale. */
-export async function findProductFresh(sku, role = 'user') {
+export async function findProductFresh(sku) {
   if (!sku) return null; // a Firestore .doc() path can't be empty
   const snap = await db().collection('products').doc(sku).get();
-  // `price` in the returned object is what THIS role pays (checkout debits it).
-  return snap.exists ? { sku, ...snap.data(), price: tierPrice(snap.data(), role) } : null;
+  return snap.exists ? { sku, ...snap.data() } : null;
 }
 
 export async function getProductRaw(sku) {
@@ -99,7 +98,14 @@ export async function getLiveCatalog(role = 'user') {
   const base = {};
 
   try {
-    for (const [sku, p] of Object.entries(await products.get())) base[sku] = { ...p, price: tierPrice(p, role) };
+    for (const [sku, p] of Object.entries(await products.get())) {
+      // One price field the storefront reads: `price` is what THIS account pays.
+      // Resellers also get retailPrice so the page can show the discount.
+      if (role === 'admin') { base[sku] = { ...p }; continue; } // admin panel sees both price lists
+      const mine = tierPrice(p, role);
+      const { priceReseller, ...rest } = p; // never expose the other tier's price list
+      base[sku] = { ...rest, price: mine, ...(mine !== Number(p.price) ? { retailPrice: Number(p.price) } : {}) };
+    }
   } catch (e) {
     console.error('[catalog] products unavailable:', e?.message || e);
   }
